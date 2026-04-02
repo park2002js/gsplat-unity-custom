@@ -95,9 +95,21 @@ namespace Gsplat
         public string AssetGuid => m_assetGuid;
         void OnValidate()
         {
+            // Fixed 'CS0121' by added GsplatAssetPhysics.cs
+            // -> Using explicit types to resolve ambiguity.
+
+            // ...Identifier(GsplatAsset, out var guid, out var localId) 
+            // -> string guid, long localID;  ...Identifier(GsplatAsset, out guid, out localId)
+            
+            // [add]
+            string guid;
+            long localId;
+
+            // [modified]
             if (GsplatAsset &&
-                AssetDatabase.TryGetGUIDAndLocalFileIdentifier(GsplatAsset, out var guid, out var localId))
+                AssetDatabase.TryGetGUIDAndLocalFileIdentifier(GsplatAsset, out guid, out localId))
                 m_assetGuid = guid;
+            
         }
 #endif // #if UNITY_EDITOR
 

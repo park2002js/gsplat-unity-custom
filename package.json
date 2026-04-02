@@ -1,7 +1,7 @@
 {
-  "author": "Yize Wu",
+  "author": "Yize Wu + PJS",
   "description": "3D Gaussian Splatting renderer",
-  "displayName": "Gsplat",
+  "displayName": "Gsplat + Custom ver0.1",
   "name": "wu.yize.gsplat",
   "version": "1.2.1",
   "license": "MIT",

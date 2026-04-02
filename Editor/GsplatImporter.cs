@@ -12,7 +12,8 @@ namespace Gsplat.Editor
     [ScriptedImporter(1, "ply")]
     public class GsplatImporter : ScriptedImporter
     {
-        public CompressionMode Compression = CompressionMode.Spark;
+        // [modified] fixed Compression Mode by Uncompressed
+        public CompressionMode Compression = CompressionMode.Uncompressed;
 
         public override void OnImportAsset(AssetImportContext ctx)
         {
@@ -35,8 +36,26 @@ namespace Gsplat.Editor
                 return;
             }
 
+            // origin rendering asset
             ctx.AddObjectToAsset("gsplatAsset", gsplatAsset);
             ctx.SetMainObject(gsplatAsset);
+
+            // =========================================================
+            // [add] two track Frame: Add Physics Asset as Sub-Asset
+            if (gsplatAsset is GsplatAssetUncompressed uncompressedSource)
+            {
+                // Physics Asset Instance
+                GsplatAssetPhysics physicsAsset = ScriptableObject.CreateInstance<GsplatAssetPhysics>();
+                physicsAsset.name = "PhysicsCollisionData";
+                
+                // Build Physics Data (from origin source)
+                physicsAsset.BuildPhysicsData(uncompressedSource);
+
+                // Add as Sub-Asset and Bundle source data into a single physics file
+                ctx.AddObjectToAsset("physicsAsset", physicsAsset);
+            }
+            // =========================================================
+
         }
     }
 
