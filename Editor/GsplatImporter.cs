@@ -12,7 +12,7 @@ namespace Gsplat.Editor
     [ScriptedImporter(1, "ply")]
     public class GsplatImporter : ScriptedImporter
     {
-        // [수정] 기본 압축 방식을 Uncompressed로 고정
+        // [modified] fixed Compression Mode by Uncompressed
         public CompressionMode Compression = CompressionMode.Uncompressed;
 
         public override void OnImportAsset(AssetImportContext ctx)
@@ -36,22 +36,22 @@ namespace Gsplat.Editor
                 return;
             }
 
-            // 원본 렌더링 에셋 등록
+            // origin rendering asset
             ctx.AddObjectToAsset("gsplatAsset", gsplatAsset);
             ctx.SetMainObject(gsplatAsset);
 
             // =========================================================
-            // [추가] 투트랙 뼈대: 물리 전용 에셋을 Sub-Asset으로 추가
+            // [add] two track Frame: Add Physics Asset as Sub-Asset
             if (gsplatAsset is GsplatAssetUncompressed uncompressedSource)
             {
-                // 물리 전용 에셋 인스턴스 생성
+                // Physics Asset Instance
                 GsplatAssetPhysics physicsAsset = ScriptableObject.CreateInstance<GsplatAssetPhysics>();
                 physicsAsset.name = "PhysicsCollisionData";
                 
-                // 원본 데이터를 넘겨주며 물리 데이터 구축 함수 실행
+                // Build Physics Data (from origin source)
                 physicsAsset.BuildPhysicsData(uncompressedSource);
 
-                // Sub-Asset으로 추가하여 하나의 파일로 묶음
+                // Add as Sub-Asset and Bundle source data into a single physics file
                 ctx.AddObjectToAsset("physicsAsset", physicsAsset);
             }
             // =========================================================
