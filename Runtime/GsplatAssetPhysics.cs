@@ -324,6 +324,36 @@ namespace Gsplat
 
         */
 
+
+
+        /*
+            Test용 API이다.
+            GsplatAssetPhysics.cs에 리소스를 생성하고, VRAM에 데이터를 전송하는 SetData 함수를 실행한다.
+            외부에서 CreateAndUploadPhysicsData()를 호출하면 자동으로 GsplatResouce가 생성되고, 생성된 Resouce에 계산된 BVH 데이터가 저장된다.
+        */
+        public GsplatResourcePhysics CreatePhysicsResource()
+        {
+            if (flatTree == null || positions == null) return null;
+            return new GsplatResourcePhysics(positions.Length, flatTree.Length);
+        }
+
+        public void UploadPhysicsData(GsplatResourcePhysics resource)
+        {
+            if (resource == null) return;
+
+            // CPU의 배열 데이터를 VRAM으로 전송
+            resource.BVHBuffer.SetData(flatTree);
+            resource.PhysPositionBuffer.SetData(positions);
+            resource.PhysRotationBuffer.SetData(rotations);
+            resource.PhysScaleBuffer.SetData(scales);
+
+            Debug.Log("[Physics] GPU VRAM에 물리 데이터 4종 업로드 완료.");
+        }
+
+
+
+
+
         // 모든 leaf node를 돌며 체크
         private void ValidateBVH(int originalCount, int validCount)
         {

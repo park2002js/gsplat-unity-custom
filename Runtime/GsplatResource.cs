@@ -86,4 +86,47 @@ namespace Gsplat
             PackedSH3Buffer = null;
         }
     }
+
+    /*
+        물리 계산을 위해 기존의 코드에서 추가된 Class
+        GsplatPhysics.compute에 정의된 Physics Data에 해당되는 4개의 Buffer에 데이터를 저장하기 위해
+        4개의 Buffer를 생성하고 관리한다.
+
+        데이터를 할당하는 역할은 GsplatAssetPhysics.cs에서 담당한다.
+    */
+    public class GsplatResourcePhysics : GsplatResource
+    {
+        public GraphicsBuffer BVHBuffer { get; private set; }
+        public GraphicsBuffer PhysPositionBuffer { get; private set; }
+        public GraphicsBuffer PhysRotationBuffer { get; private set; }
+        public GraphicsBuffer PhysScaleBuffer { get; private set; }
+
+        public GsplatResourcePhysics(int validCount, int bvhNodeCount)
+        {
+            if (validCount == 0 || bvhNodeCount == 0) return;
+
+            // 1. BVH 트리 버퍼 (32 바이트)
+            BVHBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, bvhNodeCount, Marshal.SizeOf(typeof(BVHNode1D)));
+            
+            // 2. 물리 데이터 버퍼들 (Vector3: 12바이트, Vector4: 16바이트)
+            PhysPositionBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector3)));
+            PhysRotationBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector4)));
+            PhysScaleBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector3)));
+        }
+
+        public override void Dispose()
+        {
+            BVHBuffer?.Dispose();
+            BVHBuffer = null;
+            
+            PhysPositionBuffer?.Dispose();
+            PhysPositionBuffer = null;
+
+            PhysRotationBuffer?.Dispose();
+            PhysRotationBuffer = null;
+
+            PhysScaleBuffer?.Dispose();
+            PhysScaleBuffer = null;
+        }
+    }
 }
