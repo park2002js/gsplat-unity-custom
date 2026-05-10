@@ -1,6 +1,6 @@
 // Gsplat의 물리 충돌 연산 및 시뮬레이션을 위해 생성한 Compute Shader이다.
-// 커널(진입점)의 이름은 PhysicsKernel
-#pragma kernel PhysicsKernel
+#pragma kernel BroadPhaseKernel
+#pragma kernel NarrowPhaseBVHTraversalKernel
 
 // ==========================================================
 // 1. 데이터 구조체 정의 (메모리 레이아웃)
@@ -15,63 +15,87 @@ struct BVHNode1D
     int data2;        // 4 바이트 (오른쪽 자식 인덱스 or 음수화된 가우시안 개수)
 };
 
+// 메타데이터: N개의 Gsplat 객체가 _BVHBuffer의 어디서 시작하는지 알려주는 메타데이터
+struct GsplatMetaData {
+    uint startIndex;    // 시작 인덱스
+    uint nodeCount;     // 해당 Gspat 객체의 BVH 노드 총 수
+    float4x4 worldToLocal; // 다중 객체 대응을 위해, 각각의 충돌체마다 Local 공간 변환 행렬이 필요
+};
+
+// AABB 충돌 검사를 위한 구조체
+struct AABBData {
+    float3 center;  // AABB 박스의 중심점
+    float3 extents; // AABB 박스의 모서리가 중심으로부터 얼마나 멀어졌는지 알려주는 정보
+};
+
+// RigidBody의 World 좌표계 OBB 정보
+struct RigidbodyOBB {
+    float3 center;
+    float3 extents;
+    float3 axisX;
+    float3 axisY;
+    float3 axisZ;
+};
+
 // ==========================================================
 // 2. VRAM 데이터 버퍼 선언 (C#에서 바인딩할 대상들)
 // ==========================================================
-// BVH 트리 탐색을 위한 버퍼 (Broad-phase 용)
-StructuredBuffer<BVHNode1D> _BVHBuffer;
+// 충돌 검사를 위한 버퍼 (Broad-phase 용)
+StructuredBuffer<AABBData> _RBAABBBuffer;
+StructuredBuffer<AABBData> _GaussianAABBBuffer;
+AppendStructuredBuffer<uint2> _ActivePairsWriteBuffer; // 겹친 오브젝트 쌍(rbIndex, gsIndex)을 담을 버퍼
 
-// 정밀 충돌 판정(Narrow-phase)을 위한 개별 가우시안 속성 버퍼 3종
-StructuredBuffer<float3> _PhysPositionBuffer;
-StructuredBuffer<float4> _PhysRotationBuffer;
-StructuredBuffer<float3> _PhysScaleBuffer;
+// CPU에서 넘겨준 활성화된 객체의 개수
+uint _RBCount;
+uint _GaussianCount;
+
+
+// BVH 트리 탐색을 위한 버퍼 (Narrow-phase 용)
+StructuredBuffer<uint2> _ActivePairsReadBuffer;  // appendStructuredBuffer는 읽기 불가하므로 읽기용 버퍼 생성
+StructuredBuffer<BVHNode1D> _BVHBuffer;
+StructuredBuffer<GsplatMetaData> _MetaDataBuffer;
+StructuredBuffer<RigidbodyOBB> _RBOBBBuffer;
+
+// // 정밀 충돌 판정(Narrow-phase)을 위한 개별 가우시안 속성 버퍼 3종
+// StructuredBuffer<float3> _PhysPositionBuffer;
+// StructuredBuffer<float4> _PhysRotationBuffer;
+// StructuredBuffer<float3> _PhysScaleBuffer;
 
 // CPU로 물리 연산 결과를 다시 돌려보내기 위한 Append 버퍼
 // RW을 사용할 수 있었지만, 현재의 충돌 확인 과정에서는 실제로 이 버퍼의 길이를 알 수 없기 때문에
 // Append로 유동적으로 대처 가능하도록 설정함. RW도 가능은 하지만 별도의 MaxIndex를 알리는 변수를 공유해야 함
-AppendStructuredBuffer<uint> _ResultLeafNodes;
+AppendStructuredBuffer<uint2> _ResultLeafNodes; // 충돌체 정보와 리프 노드의 인덱스를 반환하기 위한 uint2
+uint _OverlapCount; // CPU에서 넘겨줄 현재 프레임의 충돌 쌍 개수
 
 
 // ==========================================================
 // 3. OBB-AABB 박스 충돌 교차 판정을 위한 변수 및 함수
 // ==========================================================
-// C#에서 넘겨줄 Test Object의 중심값 및 회전 정보
-float3 _StickCenter;
-float3 _StickExtents; // x, y, z 반경 (Scale / 2)
-float3 _StickAxisX;   // 로컬 X축 벡터
-float3 _StickAxisY;   // 로컬 Y축 벡터
-float3 _StickAxisZ;   // 로컬 Z축 벡터
 
-// // 두 AABB 간의 단순 교차 판정 함수
-// bool IntersectAABB(float3 minA, float3 maxA, float3 minB, float3 maxB)
-// {
-//     return (minA.x <= maxB.x && maxA.x >= minB.x) &&
-//            (minA.y <= maxB.y && maxA.y >= minB.y) &&
-//            (minA.z <= maxB.z && maxA.z >= minB.z);
-// }
+// 두 AABB 간의 단순 교차 판정 함수
+bool IntersectAABB(float3 minA, float3 maxA, float3 minB, float3 maxB)
+{
+    return (minA.x <= maxB.x && maxA.x >= minB.x) &&
+           (minA.y <= maxB.y && maxA.y >= minB.y) &&
+           (minA.z <= maxB.z && maxA.z >= minB.z);
+}
 
 // 분리축 정리(SAT)를 이용한 OBB vs AABB 교차 판정 함수 (AI의 도움을 받음)
-bool IntersectOBBAABB(float3 aabbMin, float3 aabbMax)
+bool IntersectOBBAABB(float3 aabbMin, float3 aabbMax, float3 localCenter, float3 localExtents, float3 localAxisX, float3 localAxisY, float3 localAxisZ)
 {
     float3 aabbCenter = (aabbMax + aabbMin) * 0.5f;
     float3 aabbExtents = (aabbMax - aabbMin) * 0.5f;
+    float3 d = aabbCenter - localCenter;
 
-    // AABB 중심과 OBB(막대기) 중심 사이의 거리 벡터
-    float3 d = aabbCenter - _StickCenter;
-
-    // 1. AABB의 3축(X, Y, Z)에 투영하여 겹치는지 테스트
-    if (abs(d.x) > aabbExtents.x + _StickExtents.x * abs(_StickAxisX.x) + _StickExtents.y * abs(_StickAxisY.x) + _StickExtents.z * abs(_StickAxisZ.x)) return false;
-    if (abs(d.y) > aabbExtents.y + _StickExtents.x * abs(_StickAxisX.y) + _StickExtents.y * abs(_StickAxisY.y) + _StickExtents.z * abs(_StickAxisZ.y)) return false;
-    if (abs(d.z) > aabbExtents.z + _StickExtents.x * abs(_StickAxisX.z) + _StickExtents.y * abs(_StickAxisY.z) + _StickExtents.z * abs(_StickAxisZ.z)) return false;
-
-    // 2. OBB(막대기)의 3축에 투영하여 겹치는지 테스트
-    if (abs(dot(d, _StickAxisX)) > _StickExtents.x + aabbExtents.x * abs(_StickAxisX.x) + aabbExtents.y * abs(_StickAxisX.y) + aabbExtents.z * abs(_StickAxisX.z)) return false;
-    if (abs(dot(d, _StickAxisY)) > _StickExtents.y + aabbExtents.x * abs(_StickAxisY.x) + aabbExtents.y * abs(_StickAxisY.y) + aabbExtents.z * abs(_StickAxisY.z)) return false;
-    if (abs(dot(d, _StickAxisZ)) > _StickExtents.z + aabbExtents.x * abs(_StickAxisZ.x) + aabbExtents.y * abs(_StickAxisZ.y) + aabbExtents.z * abs(_StickAxisZ.z)) return false;
-
+    if (abs(d.x) > aabbExtents.x + localExtents.x * abs(localAxisX.x) + localExtents.y * abs(localAxisY.x) + localExtents.z * abs(localAxisZ.x)) return false;
+    if (abs(d.y) > aabbExtents.y + localExtents.x * abs(localAxisX.y) + localExtents.y * abs(localAxisY.y) + localExtents.z * abs(localAxisZ.y)) return false;
+    if (abs(d.z) > aabbExtents.z + localExtents.x * abs(localAxisX.z) + localExtents.y * abs(localAxisY.z) + localExtents.z * abs(localAxisZ.z)) return false;
+    if (abs(dot(d, localAxisX)) > localExtents.x + aabbExtents.x * abs(localAxisX.x) + aabbExtents.y * abs(localAxisX.y) + aabbExtents.z * abs(localAxisX.z)) return false;
+    if (abs(dot(d, localAxisY)) > localExtents.y + aabbExtents.x * abs(localAxisY.x) + aabbExtents.y * abs(localAxisY.y) + aabbExtents.z * abs(localAxisY.z)) return false;
+    if (abs(dot(d, localAxisZ)) > localExtents.z + aabbExtents.x * abs(localAxisZ.x) + localExtents.y * abs(localAxisZ.y) + localExtents.z * abs(localAxisZ.z)) return false;
+    
     return true;
 }
-
 
 // // 데이터 로드(읽기) 헬퍼 함수
 // // VRAM에 올라간 개별 가우시안의 위치, 회전, 스케일을 로컬 메모리(레지스터)로 가져오는 것을 돕는 API
@@ -82,43 +106,98 @@ bool IntersectOBBAABB(float3 aabbMin, float3 aabbMax)
 //     scale = _PhysScaleBuffer[splatIndex];
 // }
 
+
+
 // ==========================================================
-// 4. 메인 연산 로직 (진입점)
+// 4. 커널 (GPU 실행 진입점)
 // ==========================================================
-// 스레드 그룹 크기 설정 : 일반적으로 1D 배열 탐색 시 64, 256, 1024 단위를 사용하지만,
-// 실제로 BVH 트리를 탐색하는 과정은 병렬화 할 수 없으므로, 부딪히는 물체 하나당 1개의 Thread를 사용해서 BVH 트리를 탐색함
-[numthreads(1, 1, 1)]
-void PhysicsKernel(uint3 id : SV_DispatchThreadID)
+// Broad Phase (AABB 교차 검사)
+// X축은 Rigidbody 인덱스, Y축은 Gsplat 인덱스를 맡아 N:M 쌍을 병렬로 검사합니다.
+[numthreads(8, 8, 1)]
+void BroadPhaseKernel (uint3 id : SV_DispatchThreadID)
 {
+    // 스레드 ID가 유효한 객체 개수를 초과하면 연산 취소 (Out of bounds 방지)
+    if (id.x >= _RBCount || id.y >= _GaussianCount) return;
+
+    // 1. 자신의 스레드 ID에 해당하는 AABB 데이터 로드
+    AABBData rbAABB = _RBAABBBuffer[id.x];
+    AABBData gsAABB = _GaussianAABBBuffer[id.y];
+
+    // 2. center/extents 정보를 기반으로 min/max 데이터로 변환하여 AABB 검사에 사용
+    float3 minA = rbAABB.center - rbAABB.extents;
+    float3 maxA = rbAABB.center + rbAABB.extents;
+    
+    float3 minB = gsAABB.center - gsAABB.extents;
+    float3 maxB = gsAABB.center + gsAABB.extents;
+
+    // 3. AABB 교차 판정
+    if (IntersectAABB(minA, maxA, minB, maxB))
+    {
+        // 겹침이 확인되면 해당 스레드가 담당한 인덱스 쌍을 Append
+        _ActivePairsWriteBuffer.Append(uint2(id.x, id.y));
+    }
+}
+
+// Narrow Phase (BVH 트리 탐색)
+// 충돌 쌍이 담긴 배열을 1차원으로 쭉 훑으면서 탐색하므로 (64,1,1) 형태의 1D 스레드를 사용합니다.
+[numthreads(64, 1, 1)]
+void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
+{
+    // 스레드 아이디가 실제 충돌 쌍 개수보다 크면 종료
+    if (id.x >= _OverlapCount) return;
+
+    // 1. Broad Phase가 찾아낸 충돌 쌍 정보 가져오기
+    uint2 pair = _ActivePairsReadBuffer[id.x];
+    uint rbIndex = pair.x;
+    uint gsIndex = pair.y;
+
+    RigidbodyOBB rbOBB = _RBOBBBuffer[rbIndex];
+    GsplatMetaData meta = _MetaDataBuffer[gsIndex];
+
+    // 2. RigidBody의 World OBB를 대상 Gsplat의 Local 공간으로 역변환 연산
+    float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
+    float3 localAxisX  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);
+    float3 localAxisY  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
+    float3 localAxisZ  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
+    
+    // 크기는 Scale에 의해 왜곡될 수 있으므로 별도 계산
+    float3 scaleVector = float3(length(mul(meta.worldToLocal, float4(1,0,0,0))), length(mul(meta.worldToLocal, float4(0,1,0,0))), length(mul(meta.worldToLocal, float4(0,0,1,0))));
+    float3 localExtents = rbOBB.extents * scaleVector;
+
+    // 3. 로컬 스택 선언 및 초기화
     // Computer Shader에서는 재귀 함수를 사용하지 못하므로 스택 자료구조를 사용해서 탐색
     // HLSL 로컬 메모리를 이용한 스택 선언 (GsplatAssetPhysics.cs 내에 정의된 depth 정책(최대 깊이 24)에서 좀 더 여유를 둠)
     uint stack[32];
     int stackPtr = 0;
 
-    // 루트 노드(0번 인덱스)부터 탐색 시작
+    // 루트 노드 인덱스 0번 추가
     stack[stackPtr++] = 0; 
     
+    // 4. 깊이 우선 탐색 로직 시작
     while(stackPtr > 0)
     {
-        // Pop
-        uint nodeIdx = stack[--stackPtr];
-        BVHNode1D node = _BVHBuffer[nodeIdx];
+        // 최상단 노드 추출
+        uint localNodeIdx = stack[--stackPtr];
         
-        // 충돌하려는 외부 물체와 현재 노드의 AABB 교차 검사
-        if(IntersectOBBAABB(node.boundsMin, node.boundsMax))
+        // BVH 버퍼 상의 실제 절대 주소 계산
+        uint globalNodeIdx = meta.startIndex + localNodeIdx;
+        BVHNode1D node = _BVHBuffer[globalNodeIdx];
+        
+        // 역변환된 OBB 데이터를 이용해 교차 검사 실행
+        if(IntersectOBBAABB(node.boundsMin, node.boundsMax, localCenter, localExtents, localAxisX, localAxisY, localAxisZ))
         {
             if(node.data2 <= 0) // 리프 노드인 경우
             {
-                // 결과 버퍼에 노드 인덱스 추가
-                _ResultLeafNodes.Append(nodeIdx);
+                // 리프 노드에 도달하면 어떤 RigidBody가 BVH의 어떤 Leaf 노드와 부딪혔는지 기록
+                _ResultLeafNodes.Append(uint2(rbIndex, globalNodeIdx));
             }
             else // 내부(Internal) 노드인 경우: 자식 노드들을 스택에 Push
             {
                 // 스택 오버플로우 방지 : 30인 이유는 위에서 uint stack[32]인 것과, 그리고 내부 노드를 만나면 한번에 2개의 데이터를 Push하기 때문
                 if(stackPtr < 30) 
                 {
-                    stack[stackPtr++] = node.data1; // 왼쪽 자식
-                    stack[stackPtr++] = node.data2; // 오른쪽 자식
+                    stack[stackPtr++] = node.data1; 
+                    stack[stackPtr++] = node.data2; 
                 }
             }
         }
