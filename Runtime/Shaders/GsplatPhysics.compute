@@ -1,6 +1,7 @@
 // Gsplat의 물리 충돌 연산 및 시뮬레이션을 위해 생성한 Compute Shader이다.
 #pragma kernel BroadPhaseKernel
 #pragma kernel NarrowPhaseBVHTraversalKernel
+#pragma kernel NarrowPhaseMahalanobisKernel
 
 // ==========================================================
 // 1. 데이터 구조체 정의 (메모리 레이아웃)
@@ -19,7 +20,10 @@ struct BVHNode1D
 struct GsplatMetaData {
     uint startIndex;    // 시작 인덱스
     uint nodeCount;     // 해당 Gspat 객체의 BVH 노드 총 수
+    uint gaussianStartIndex; // 가우시안 속성 배열의 시작 인덱스
+    uint gaussianCount;     // 가우시안의 총 개수
     float4x4 worldToLocal; // 다중 객체 대응을 위해, 각각의 충돌체마다 Local 공간 변환 행렬이 필요
+    float4x4 localToWorld; // 가중 평균된 Leaf node의 Local Position을 World로 되돌릴 때 사용
 };
 
 // AABB 충돌 검사를 위한 구조체
@@ -56,22 +60,45 @@ StructuredBuffer<BVHNode1D> _BVHBuffer;
 StructuredBuffer<GsplatMetaData> _MetaDataBuffer;
 StructuredBuffer<RigidbodyOBB> _RBOBBBuffer;
 
-// // 정밀 충돌 판정(Narrow-phase)을 위한 개별 가우시안 속성 버퍼 3종
-// StructuredBuffer<float3> _PhysPositionBuffer;
-// StructuredBuffer<float4> _PhysRotationBuffer;
-// StructuredBuffer<float3> _PhysScaleBuffer;
+// 정밀 충돌 판정(Narrow-phase)을 위한 개별 가우시안 속성 버퍼 3종
+StructuredBuffer<float3> _PhysPositionBuffer;
+StructuredBuffer<float4> _PhysRotationBuffer;
+StructuredBuffer<float3> _PhysScaleBuffer;
 
 // CPU로 물리 연산 결과를 다시 돌려보내기 위한 Append 버퍼
 // RW을 사용할 수 있었지만, 현재의 충돌 확인 과정에서는 실제로 이 버퍼의 길이를 알 수 없기 때문에
 // Append로 유동적으로 대처 가능하도록 설정함. RW도 가능은 하지만 별도의 MaxIndex를 알리는 변수를 공유해야 함
-AppendStructuredBuffer<uint2> _ResultLeafNodes; // 충돌체 정보와 리프 노드의 인덱스를 반환하기 위한 uint2
+
+// BVH 트리 탐색 결과인 충돌체 정보와 리프 노드의 인덱스(총 uint2)를 반환하기 위한 버퍼
+AppendStructuredBuffer<uint3> _BVHTraversalResultWriteBuffer;
 uint _OverlapCount; // CPU에서 넘겨줄 현재 프레임의 충돌 쌍 개수
 
+// 마할라노비스 거리 계산을 하기 위해서, BVH 트리 탐색 결과를 읽기 위한 버퍼
+StructuredBuffer<uint3> _BVHTraversalResultReadBuffer;
 
 // ==========================================================
-// 3. OBB-AABB 박스 충돌 교차 판정을 위한 변수 및 함수
+// [Debug] 테스트 용도의 구조체, 변수, 함수들 처리
 // ==========================================================
 
+// [dispatch3test]
+// Normal Vector 추출 증명용 구조체 및 버퍼
+struct dispatch3testData {
+    float3 position;
+    float3 normal;
+};
+
+// 0 ~ 3 사이로 실시간 조절될 임계값
+float _DistanceThreshold; 
+
+// 0번 Thread가 결과에 해당하는 Leaf node의 position과 Normal vector를 저장할 버퍼
+AppendStructuredBuffer<dispatch3testData> _Dispatch3TestResultBuffer;
+
+
+// ==========================================================
+// 3. 헬퍼 함수들
+// ==========================================================
+
+/// OBB-AABB 박스 충돌 교차 판정을 위한 변수 및 함수
 // 두 AABB 간의 단순 교차 판정 함수
 bool IntersectAABB(float3 minA, float3 maxA, float3 minB, float3 maxB)
 {
@@ -95,6 +122,15 @@ bool IntersectOBBAABB(float3 aabbMin, float3 aabbMax, float3 localCenter, float3
     if (abs(dot(d, localAxisZ)) > localExtents.z + aabbExtents.x * abs(localAxisZ.x) + localExtents.y * abs(localAxisZ.y) + localExtents.z * abs(localAxisZ.z)) return false;
     
     return true;
+}
+
+/// 마할라노비스 거리 계산을 위한 함수
+// 쿼터니언(x, y, z, w)을 사용하여 3D 벡터를 회전시키는 함수
+float3 RotateVectorByQuaternion(float3 v, float4 q)
+{
+    float3 u = q.xyz;
+    float s = q.w;
+    return 2.0f * dot(u, v) * u + (s * s - dot(u, u)) * v + 2.0f * s * cross(u, v);
 }
 
 // // 데이터 로드(읽기) 헬퍼 함수
@@ -138,7 +174,7 @@ void BroadPhaseKernel (uint3 id : SV_DispatchThreadID)
     }
 }
 
-// Narrow Phase (BVH 트리 탐색)
+// Narrow Phase 1 : (BVH 트리 탐색)
 // 충돌 쌍이 담긴 배열을 1차원으로 쭉 훑으면서 탐색하므로 (64,1,1) 형태의 1D 스레드를 사용합니다.
 [numthreads(64, 1, 1)]
 void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
@@ -155,10 +191,10 @@ void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
     GsplatMetaData meta = _MetaDataBuffer[gsIndex];
 
     // 2. RigidBody의 World OBB를 대상 Gsplat의 Local 공간으로 역변환 연산
-    float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
-    float3 localAxisX  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);
-    float3 localAxisY  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
-    float3 localAxisZ  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
+    float3 localCenter = mul(float4(rbOBB.center, 1.0f), meta.worldToLocal).xyz;
+    float3 localAxisX  = normalize(mul(float4(rbOBB.axisX, 0.0f), meta.worldToLocal).xyz);
+    float3 localAxisY  = normalize(mul(float4(rbOBB.axisY, 0.0f), meta.worldToLocal).xyz);
+    float3 localAxisZ  = normalize(mul(float4(rbOBB.axisZ, 0.0f), meta.worldToLocal).xyz);
     
     // 크기는 Scale에 의해 왜곡될 수 있으므로 별도 계산
     float3 scaleVector = float3(length(mul(meta.worldToLocal, float4(1,0,0,0))), length(mul(meta.worldToLocal, float4(0,1,0,0))), length(mul(meta.worldToLocal, float4(0,0,1,0))));
@@ -189,7 +225,7 @@ void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
             if(node.data2 <= 0) // 리프 노드인 경우
             {
                 // 리프 노드에 도달하면 어떤 RigidBody가 BVH의 어떤 Leaf 노드와 부딪혔는지 기록
-                _ResultLeafNodes.Append(uint2(rbIndex, globalNodeIdx));
+                _BVHTraversalResultWriteBuffer.Append(uint3(rbIndex, gsIndex, globalNodeIdx));
             }
             else // 내부(Internal) 노드인 경우: 자식 노드들을 스택에 Push
             {
@@ -201,5 +237,187 @@ void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
                 }
             }
         }
+    }
+}
+
+
+
+// Narrow Phase 2 : (마할라노비스 거리 탐색)
+// Leaf Node 정보가 담긴 배열의 원소에 있는 최대 32개의 가우시안을 담당하여 계산하기 위해 (32,1,1) 형태의 1D 스레드를 사용합니다.
+
+// 그룹 내의 32개 Thread가 공용으로 사용할 누적 메모리
+groupshared int sharedNormX;
+groupshared int sharedNormY;
+groupshared int sharedNormZ;
+groupshared int sharedPosX;
+groupshared int sharedPosY;
+groupshared int sharedPosZ;
+groupshared int sharedWeightSum;
+
+[numthreads(32, 1, 1)]
+void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+    // 1. 0번 Thread가 그룹 공유 메모리 초기화
+    if (groupThreadID.x == 0)
+    {
+        sharedNormX = 0; sharedNormY = 0; sharedNormZ = 0;
+        sharedPosX = 0; sharedPosY = 0; sharedPosZ = 0;
+        sharedWeightSum = 0;
+    }
+
+    // 그 그룹 내의 모든 Thread가 초기화를 기다리도록 동기화
+    GroupMemoryBarrierWithGroupSync();
+
+    // 2. 변경된 Read 버퍼에서 현재 그룹이 담당할 충돌 쌍 정보(RigidBody 인덱스, Global Node 인덱스) 가져오기, groupID.x가 충돌 쌍의 인덱스에 해당
+    uint3 pair = _BVHTraversalResultReadBuffer[groupID.x];
+    uint rbIndex = pair.x;
+    uint gsIndex = pair.y;
+    uint globalNodeIdx = pair.z;
+
+    BVHNode1D node = _BVHBuffer[globalNodeIdx];
+
+    // 3. 리프 노드 내부의 가우시안 데이터 접근
+    if (node.data2 <= 0) 
+    {
+        uint gaussianStartIdx = node.data1;
+        uint gaussianCount = (uint)(-node.data2); 
+
+        // 자신의 Thread ID가 가우시안 개수 이내일 때만 연산 참여
+        if (groupThreadID.x < gaussianCount)
+        {
+            // meta.gaussianStartIndex 오프셋을 더해줌으로써 다른 객체의 가우시안을 침범하지 않도록 함.
+            GsplatMetaData meta = _MetaDataBuffer[gsIndex];
+            uint myGaussianIndex = meta.gaussianStartIndex + gaussianStartIdx + groupThreadID.x;
+
+            // ====================마할라노비스 거리 연산====================
+            
+            //GsplatMetaData meta = _MetaDataBuffer[gsIndex];
+            RigidbodyOBB rbOBB = _RBOBBBuffer[rbIndex];
+
+            // 1. OBB 정보를 Gsplat Local 공간으로 역변환 
+            float3 localCenter = mul(float4(rbOBB.center, 1.0f), meta.worldToLocal).xyz;
+            float3 localAxisX  = normalize(mul(float4(rbOBB.axisX, 0.0f), meta.worldToLocal).xyz);
+            float3 localAxisY  = normalize(mul(float4(rbOBB.axisY, 0.0f), meta.worldToLocal).xyz);
+            float3 localAxisZ  = normalize(mul(float4(rbOBB.axisZ, 0.0f), meta.worldToLocal).xyz);
+            
+            float3 scaleVector = float3(
+                length(mul(float4(1,0,0,0), meta.worldToLocal)), 
+                length(mul(float4(0,1,0,0), meta.worldToLocal)), 
+                length(mul(float4(0,0,1,0), meta.worldToLocal))
+            );
+            float3 localExtents = rbOBB.extents * scaleVector;
+
+            // 2. 가우시안 데이터 추출
+            float3 gPos = _PhysPositionBuffer[myGaussianIndex];
+            float4 gRot = _PhysRotationBuffer[myGaussianIndex];
+            float3 gScale = _PhysScaleBuffer[myGaussianIndex];
+
+            // 3. 가우시안 중심점에서 OBB 중심점으로 향하는 벡터
+            float3 d = gPos - localCenter;
+
+            // 4. 이 벡터를 OBB의 3개 축에 각각 투영하여 거리를 측정, 이때 OBB의 상자 크기(Extents) 안으로 강제 절삭(Clamp)하여 수선의 발을 구함
+            float distX = clamp(dot(d, localAxisX), -localExtents.x, localExtents.x);
+            float distY = clamp(dot(d, localAxisY), -localExtents.y, localExtents.y);
+            float distZ = clamp(dot(d, localAxisZ), -localExtents.z, localExtents.z);
+
+            // 5. Closest Point (OBB 표면에서 가우시안과 가장 가까운 점) 획득
+            float3 closestPointLocal = localCenter + distX * localAxisX + distY * localAxisY + distZ * localAxisZ;
+
+            // 6. 이동 취소 (Un-translate) : 가우시안 중심을 원점으로 만듦. 가우시안 중심(gPos)과 방금 찾은 수선의 발(closestPointLocal)의 차이로 구현
+            float3 deltaPos = closestPointLocal - gPos;
+
+            // 7. 회전 취소 (Un-rotate) : 쿼터니언의 켤레(Conjugate)를 이용해 역회전
+            float4 qInv = float4(-gRot.x, -gRot.y, -gRot.z, gRot.w);
+            float3 localDelta = RotateVectorByQuaternion(deltaPos, qInv);
+
+            // 8. 스케일 취소 (Un-scale) : 축별로 찌그러진 타원체를 구(Sphere)로 폄
+            float3 scaledDelta = localDelta / max(gScale, 0.00001f);
+
+            // 9. 최종 마할라노비스 거리 : 타원 공간을 구형 공간으로 폈으므로, 이 벡터의 길이가 곧 마할라노비스 거리(Sigma)가 됨
+            float myDistance = length(scaledDelta);
+
+            // ==========================================================
+            
+
+            if (myDistance <= _DistanceThreshold)
+            {
+                // ===================Normal Vector 연산====================
+                // 1. Scale 값 중 가장 작은 값을 가지는 로컬 축(X, Y, Z) 찾기
+                float3 localAxis;
+                if (gScale.x <= gScale.y && gScale.x <= gScale.z) {
+                    localAxis = float3(1, 0, 0);
+                } else if (gScale.y <= gScale.x && gScale.y <= gScale.z) {
+                    localAxis = float3(0, 1, 0);
+                } else {
+                    localAxis = float3(0, 0, 1);
+                }
+
+                // 2. 찾아낸 로컬 축을 가우시안의 회전값(gRot)으로 회전시켜 Gsplat Local 공간의 Normal로 변환
+                float3 myLocalNormal = RotateVectorByQuaternion(localAxis, gRot);
+
+                // 3. Normal 방향 보정 (OBB를 향하도록)
+                // 가우시안 타원의 축은 앞/뒤 구분이 없으므로, OBB 중심(localCenter)을 향하는 방향과 내적하여 반대를 보고 있다면 뒤집어줍니다.
+                float3 dirToClosest = closestPointLocal - gPos;
+                if (dot(myLocalNormal, dirToClosest) < 0) {
+                    myLocalNormal = -myLocalNormal;
+                }
+
+                // 4. World 공간의 Normal로 변환하여 최종 정규화
+                // Normal은 (WorldToLocal)^T 행렬을 곱해야 합니다.
+                // HLSL 메모리 구조상 meta.worldToLocal이 이미 전치되어 있으므로, mul(matrix, vector)를 쓰면 완벽하게 들어맞습니다.
+                float3 worldNormal = normalize(mul((float3x3)meta.worldToLocal, myLocalNormal));
+                // ==========================================================
+                
+                // ===================가중합 누적====================
+                // 거리를 역수로 취하여 거리가 짧을수록 가중치가 커지도록 설정
+                // 거리가 0일 때 무한대가 되는 것을 방지하기 위해 입실론을 더함, 여기서는 (0.0001f)으로 설정
+                float myWeight = 1.0f / (myDistance + 0.0001f);
+                float3 weightedNormal = worldNormal * myWeight;
+                float3 weightedPos = gPos * myWeight; // 가우시안의 위치(gPos)도 가중치를 곱함
+                
+                // float 형태의 데이터를 InterlockedAdd 함수에 쓰기 위한 고정 소수점 스케일 변환
+                int scale = 10000;
+
+                // 레이스 컨디션 없이 안전하게 32개의 데이터를 원자적 누적
+                InterlockedAdd(sharedNormX, (int)(weightedNormal.x * scale));
+                InterlockedAdd(sharedNormY, (int)(weightedNormal.y * scale));
+                InterlockedAdd(sharedNormZ, (int)(weightedNormal.z * scale));
+                InterlockedAdd(sharedPosX, (int)(weightedPos.x * scale));
+                InterlockedAdd(sharedPosY, (int)(weightedPos.y * scale));
+                InterlockedAdd(sharedPosZ, (int)(weightedPos.z * scale));
+                InterlockedAdd(sharedWeightSum, (int)(myWeight * scale));
+            }
+        }
+    }
+
+    // 6. 그룹 내의 32개의 Thread가 원자적 누적 연산을 모두 마칠 때까지 대기
+    GroupMemoryBarrierWithGroupSync();
+
+    // 7. 0번 Thread가 그룹을 대표하여 최종 Normal 계산 및 버퍼 출력
+    if (groupThreadID.x == 0 && sharedWeightSum > 0)
+    {
+        float scaleFloat = 10000.0f;
+        float totalWeight = (float)sharedWeightSum / scaleFloat;
+
+        // 정규화된 최종 Normal Vector
+        float3 finalNormal = float3(sharedNormX, sharedNormY, sharedNormZ) / scaleFloat;
+        finalNormal = normalize(finalNormal / totalWeight);
+        
+        // 정규화된 최종 Local Position (가중 평균)
+        float3 finalLocalPos = float3(sharedPosX, sharedPosY, sharedPosZ) / scaleFloat;
+        finalLocalPos /= totalWeight;
+
+        // 가중합으로 구해진 Local Position을 World Position으로 변환
+        GsplatMetaData meta = _MetaDataBuffer[gsIndex];
+        float3 finalWorldPos = mul(meta.localToWorld, float4(finalLocalPos, 1.0f)).xyz;
+
+        // 가중치 평균 적용 및 방향 정규화
+        finalNormal = normalize(finalNormal / totalWeight);
+
+        dispatch3testData resultData;
+        resultData.position = finalWorldPos;
+        resultData.normal = finalNormal;
+
+        _Dispatch3TestResultBuffer.Append(resultData);
     }
 }
