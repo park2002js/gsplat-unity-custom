@@ -175,8 +175,8 @@ void BroadPhaseKernel (uint3 id : SV_DispatchThreadID)
 }
 
 // Narrow Phase 1 : (BVH 트리 탐색)
-// 충돌 쌍이 담긴 배열을 1차원으로 쭉 훑으면서 탐색하므로 (64,1,1) 형태의 1D 스레드를 사용합니다.
-[numthreads(64, 1, 1)]
+// 충돌 쌍이 담긴 배열을 1차원으로 쭉 훑으면서 탐색하므로 (32,1,1) 형태의 1D 스레드를 사용합니다.
+[numthreads(32, 1, 1)]
 void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
 {
     // 스레드 아이디가 실제 충돌 쌍 개수보다 크면 종료
