@@ -191,18 +191,18 @@ void NarrowPhaseBVHTraversalKernel (uint3 id : SV_DispatchThreadID)
     GsplatMetaData meta = _MetaDataBuffer[gsIndex];
 
     // 2. RigidBody의 World OBB를 대상 Gsplat의 Local 공간으로 역변환 연산
-    float3 localCenter = mul(float4(rbOBB.center, 1.0f), meta.worldToLocal).xyz;
-    float3 localAxisX  = normalize(mul(float4(rbOBB.axisX, 0.0f), meta.worldToLocal).xyz);
-    float3 localAxisY  = normalize(mul(float4(rbOBB.axisY, 0.0f), meta.worldToLocal).xyz);
-    float3 localAxisZ  = normalize(mul(float4(rbOBB.axisZ, 0.0f), meta.worldToLocal).xyz);
+    float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
+    float3 localAxisX  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);
+    float3 localAxisY  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
+    float3 localAxisZ  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
     
     // 크기는 Scale에 의해 왜곡될 수 있으므로 별도 계산
     // 오브젝트의 Scale을 행렬에서 추출하려면, 변환 행렬을 구성하는 3개의 기저 벡터에 해당하는 행렬의 '열 벡터'의 길이를 구해야 함
     // HLSL에서 특정 행렬의 '행'을 추출하는 수학적 방법은 행 벡터를 앞에 곱하는 것이므로 mul(vector, matrix) 순서로 곱한다.
     float3 scaleVector = float3(
-        length(mul(float4(1,0,0,0), meta.worldToLocal)), 
-        length(mul(float4(0,1,0,0), meta.worldToLocal)), 
-        length(mul(float4(0,0,1,0), meta.worldToLocal))
+        length(mul(meta.worldToLocal, float4(1,0,0,0))), 
+        length(mul(meta.worldToLocal, float4(0,1,0,0))), 
+        length(mul(meta.worldToLocal, float4(0,0,1,0)))
     );
     float3 localExtents = rbOBB.extents * scaleVector;
 
@@ -301,16 +301,16 @@ void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadI
             RigidbodyOBB rbOBB = _RBOBBBuffer[rbIndex];
 
             // 1. OBB 정보를 Gsplat Local 공간으로 역변환 
-            float3 localCenter = mul(float4(rbOBB.center, 1.0f), meta.worldToLocal).xyz;
-            float3 localAxisX  = normalize(mul(float4(rbOBB.axisX, 0.0f), meta.worldToLocal).xyz);
-            float3 localAxisY  = normalize(mul(float4(rbOBB.axisY, 0.0f), meta.worldToLocal).xyz);
-            float3 localAxisZ  = normalize(mul(float4(rbOBB.axisZ, 0.0f), meta.worldToLocal).xyz);
+            float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
+            float3 localAxisX  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);
+            float3 localAxisY  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
+            float3 localAxisZ  = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
 
             // 크기는 Scale에 의해 왜곡될 수 있으므로 별도 계산 
             float3 scaleVector = float3(
-                length(mul(float4(1,0,0,0), meta.worldToLocal)), 
-                length(mul(float4(0,1,0,0), meta.worldToLocal)), 
-                length(mul(float4(0,0,1,0), meta.worldToLocal))
+                length(mul(meta.worldToLocal, float4(1,0,0,0))), 
+                length(mul(meta.worldToLocal, float4(0,1,0,0))), 
+                length(mul(meta.worldToLocal, float4(0,0,1,0)))
             );
             float3 localExtents = rbOBB.extents * scaleVector;
 
@@ -371,8 +371,8 @@ void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadI
 
                 // 4. World 공간의 Normal로 변환하여 최종 정규화
                 // world 좌표계의 Normal을 구하기 위해서는 "'Local 좌표계를 World 좌표계로 변환하는 변환 행렬(L2W)'의 역행렬(^-1)의 전치 행렬(^T)"를 곱해야 한다. = (L2W^-1)^T
-                // HLSL은 행렬을 C#과 다른 방향으로 읽음으로써 자동으로 전치되므로, 변환 행렬의 역행렬에 해당하는 World To Local 변환행렬 (W2L)을 곱한다.
-                float3 worldNormal = normalize(mul((float3x3)meta.worldToLocal, myLocalNormal));
+                // 역행렬 전치를 곱해야 하는 이유는, "비균등 스케일"때문이다. 여기서 "역행렬"은 L2W대신 W2L을 곱하는 것으로, 전치는 순서를 뒤집는 것으로 적용하여, 결과적으로는 mul(v,M)으로 한다.
+                float3 worldNormal = normalize(mul(myLocalNormal, (float3x3)meta.worldToLocal));
                 // ==========================================================
                 
                 // ===================가중합 누적====================
@@ -417,10 +417,7 @@ void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadI
         // 가중합으로 구해진 Local Position을 World Position으로 변환
         GsplatMetaData meta = _MetaDataBuffer[gsIndex];
         // 위에서의 World To Local 좌표계 변환처럼, Local To World 역시 mul(vector, matrix) 형태가 되어야 한다.
-        float3 finalWorldPos = mul(float4(finalLocalPos, 1.0f), meta.localToWorld).xyz;
-
-        // 가중치 평균 적용 및 방향 정규화
-        finalNormal = normalize(finalNormal / totalWeight);
+        float3 finalWorldPos = mul(meta.localToWorld, float4(finalLocalPos, 1.0f)).xyz;
 
         dispatch3testData resultData;
         resultData.position = finalWorldPos;
