@@ -5,6 +5,8 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Android;
+using Microsoft.Win32.SafeHandles;
 
 namespace Gsplat
 {
@@ -52,6 +54,9 @@ namespace Gsplat
 
         [Header("Artifact Filtering")]
         [SerializeField] private int artifactRatio = 100;
+        [SerializeField] private float artifactOpacity = 0.3f;  // 불투명도가 이 임계값 미만이면 artifact로 판단
+        [SerializeField] private float artifactSphereRatio = 0.8f; // 가장 긴 축과 가장 짧은 축의 비율이 이 임계값 초과이면 artifact로 판단
+
 
         // 빌드용 임시 데이터 구조체
         private struct BuildData
@@ -63,14 +68,24 @@ namespace Gsplat
 
         public void BuildPhysicsData(GsplatAssetUncompressed source)
         {
+            System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();  
+            stopwatch.Start();
+
+
             Debug.Log("[Physics] BVH 기반 물리 데이터 정렬 및 구축 시작...");
             int count = (int)source.SplatCount;
+
+
 
             // 1. 빌드용 임시 데이터 생성 
             // 모든 가우시안의 정보를 각각 원소로써 저장하기 위한 빈 리스트 생성. 리스트인 이유는 필터링 때문에 길이가 가변적이므로.
             List<BuildData> buildDataList = new List<BuildData>(count);
             for (int i = 0; i < count; i++)
             {
+                // GsplatAssetUncompressed에서 'public Vector4[] Colors; // RGB, Opacity' 로 Colors 배열에 시그마로 된 Opacity 값을 저장하므로 이를 이용
+                // 임계값 보다 미만이면 필터링되어 사용되지 않음
+                if (source.Colors[i].w < artifactOpacity) continue; 
+
                 // i번째 가우시안 점의 각 축의 Scale 방향 : x, y, z
                 Vector3 s = source.Scales[i]; 
 
@@ -79,14 +94,14 @@ namespace Gsplat
                 float minS = Mathf.Min(s.x, Mathf.Min(s.y, s.z));
                 float midS = s.x + s.y + s.z - maxS - minS; // 두 번째로 긴 축
 
-                // 0으로 나누기 방지를 위해 최소값 적용
-                float ratio = maxS / Mathf.Max(midS, 1e-5f);
+                
+                // 중간 축과 가장 긴 축을 비교하여, 그 비율이 임계값을 초과하면 바늘 형태의 아티펙트라 판단하고 건너 뜀
+                if ((maxS / Mathf.Max(midS, 1e-5f)) > artifactRatio) continue;  // 0으로 나누기 방지를 위해 최소값 적용
 
-                if (ratio > artifactRatio)
-                {
-                    // 아티팩트로 판정된 경우 리스트에 넣지 않고 다음 가우시안으로 건너뜀
-                    continue; 
-                }
+                // 가장 짧은 축과 가장 긴 축을 비교하여, 그 비율이 임계값을 초과하면 구 형태의 아티펙트로 판단하고 건너 뜀
+                if ((minS / Mathf.Max(maxS, 1e-5f)) > artifactSphereRatio) continue;
+
+
                 BuildData bData = new BuildData();
                 bData.originalIndex = i;
                 bData.center = source.Positions[i];
@@ -152,7 +167,9 @@ namespace Gsplat
                 rotations[i] = new Vector4(rawRot.y, rawRot.z, rawRot.w, rawRot.x);
             }
 
-            Debug.Log($"[Physics] 총 {count}개의 가우시안 → 아티팩트 필터링 후: {validCount}개 → BVH 노드 {flatTree.Length}개 생성 및 데이터 정렬 완료");
+            stopwatch.Stop();
+            Debug.Log($"[Physics] 총 {count}개의 가우시안 → 아티팩트 필터링 후: {validCount}개 → BVH 노드 {flatTree.Length}개 생성 및 데이터 정렬 완료.");
+            Debug.Log($"[Physics] 전처리 소요 시간: {stopwatch.ElapsedMilliseconds}ms");
 
             // 필터링된 데이터들을 기준으로 검증
             ValidateBVH(count, validCount);
