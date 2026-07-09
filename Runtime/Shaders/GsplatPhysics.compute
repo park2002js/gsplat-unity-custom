@@ -260,6 +260,10 @@ groupshared int sharedPosY;
 groupshared int sharedPosZ;
 groupshared int sharedWeightSum;
 
+// Gsplat 인덱스를 기준으로 힘(법선)을 누적할 RW 버퍼 (int3 사용)
+// Append가 아닌 RW 버퍼를 쓴 이유는 정확한 gsIndex 주소에 맞춰서 결과를 업데이트 해주어야 했기 때문
+RWStructuredBuffer<int3> _GsplatForceOutputBuffer;
+
 [numthreads(32, 1, 1)]
 void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
@@ -409,6 +413,14 @@ void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadI
         // 정규화된 최종 Normal Vector
         float3 finalNormal = float3(sharedNormX, sharedNormY, sharedNormZ) / scaleFloat;
         finalNormal = normalize(finalNormal / totalWeight);
+
+
+        // 물리 시뮬레이션 계산을 위해, 최종 Normal Vector들 값을, 중앙 관리를 위해 Gsplat 고유 ID(gsIndex)에 법선 벡터 값을 누적
+        int scale = 10000; // InterLockedAdd는 정수형만 지원하므로, float 형태의 노말 백터를 정수형으로 강제 스케일링
+        InterlockedAdd(_GsplatForceOutputBuffer[gsIndex].x, (int)(finalNormal.x * scale)); // InterLockedAdd를 통해 원자성 보장
+        InterlockedAdd(_GsplatForceOutputBuffer[gsIndex].y, (int)(finalNormal.y * scale));
+        InterlockedAdd(_GsplatForceOutputBuffer[gsIndex].z, (int)(finalNormal.z * scale));
+
         
         // 정규화된 최종 Local Position (가중 평균)
         float3 finalLocalPos = float3(sharedPosX, sharedPosY, sharedPosZ) / scaleFloat;
