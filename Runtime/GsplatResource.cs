@@ -89,8 +89,7 @@ namespace Gsplat
 
     /*
         물리 계산을 위해 기존의 코드에서 추가된 Class
-        GsplatPhysics.compute에 정의된 Physics Data에 해당되는 4개의 Buffer에 데이터를 저장하기 위해
-        4개의 Buffer를 생성하고 관리한다.
+        BVH와 GsplatPhysics.compute의 Gaussian Physics Data에 해당하는 5개 Buffer를 생성하고 관리한다.
 
         데이터를 할당하는 역할은 GsplatAssetPhysics.cs에서 담당한다.
     */
@@ -100,6 +99,7 @@ namespace Gsplat
         public GraphicsBuffer PhysPositionBuffer { get; private set; }
         public GraphicsBuffer PhysRotationBuffer { get; private set; }
         public GraphicsBuffer PhysScaleBuffer { get; private set; }
+        public GraphicsBuffer PhysOpacityBuffer { get; private set; }
 
         public GsplatResourcePhysics(int validCount, int bvhNodeCount)
         {
@@ -112,6 +112,7 @@ namespace Gsplat
             PhysPositionBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector3)));
             PhysRotationBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector4)));
             PhysScaleBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, Marshal.SizeOf(typeof(Vector3)));
+            PhysOpacityBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount, sizeof(float));
         }
 
         public override void Dispose()
@@ -127,6 +128,9 @@ namespace Gsplat
 
             PhysScaleBuffer?.Dispose();
             PhysScaleBuffer = null;
+
+            PhysOpacityBuffer?.Dispose();
+            PhysOpacityBuffer = null;
         }
     }
 }

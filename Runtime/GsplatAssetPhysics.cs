@@ -47,6 +47,7 @@ namespace Gsplat
         [HideInInspector] public Vector3[] positions;
         [HideInInspector] public Vector4[] rotations;
         [HideInInspector] public Vector3[] scales;
+        [HideInInspector] public float[] opacities;
 
 
         // Flat BVH Tree (for GPU VRAM)
@@ -154,12 +155,14 @@ namespace Gsplat
             positions = new Vector3[validCount];
             rotations = new Vector4[validCount];
             scales = new Vector3[validCount];
+            opacities = new float[validCount];
 
             for (int i = 0; i < validCount; i++)
             {
                 int origIdx = buildData[i].originalIndex;
                 positions[i] = source.Positions[origIdx];
                 scales[i] = source.Scales[origIdx];
+                opacities[i] = source.Colors[origIdx].w;
 
                 // 원본 데이터 (W, X, Y, Z)
                 Vector4 rawRot = source.Rotations[origIdx];
@@ -350,7 +353,7 @@ namespace Gsplat
         */
         public GsplatResourcePhysics CreatePhysicsResource()
         {
-            if (flatTree == null || positions == null) return null;
+            if (flatTree == null || positions == null || opacities == null) return null;
             return new GsplatResourcePhysics(positions.Length, flatTree.Length);
         }
 
@@ -363,8 +366,9 @@ namespace Gsplat
             resource.PhysPositionBuffer.SetData(positions);
             resource.PhysRotationBuffer.SetData(rotations);
             resource.PhysScaleBuffer.SetData(scales);
+            resource.PhysOpacityBuffer.SetData(opacities);
 
-            Debug.Log("[Physics] GPU VRAM에 물리 데이터 4종 업로드 완료.");
+            Debug.Log("[Physics] GPU VRAM에 BVH와 Gaussian 물리 데이터 4종 업로드 완료.");
         }
 
 

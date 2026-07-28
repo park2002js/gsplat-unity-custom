@@ -69,6 +69,7 @@ StructuredBuffer<RigidbodyOBB> _RBOBBBuffer;
 StructuredBuffer<float3> _PhysPositionBuffer;
 StructuredBuffer<float4> _PhysRotationBuffer;
 StructuredBuffer<float3> _PhysScaleBuffer;
+StructuredBuffer<float> _PhysOpacityBuffer;
 
 // CPU로 물리 연산 결과를 다시 돌려보내기 위한 Append 버퍼
 // RW을 사용할 수 있었지만, 현재의 충돌 확인 과정에서는 실제로 이 버퍼의 길이를 알 수 없기 때문에
@@ -447,192 +448,125 @@ void NarrowPhaseMahalanobisKernel(uint3 groupID : SV_GroupID, uint3 groupThreadI
 }
 */
 
-// Rigidbody 적용용 36바이트 결과
+// Rigidbody 적용용 leaf 단위 밀도장 부분합 (36바이트)
 struct rigidBodyData
 {
     uint rbIndex;
     uint gsIndex;
     float3 position;
-    float3 normal;
-    float penetration;
+    float3 gradient;
+    float density;
 };
 
 AppendStructuredBuffer<rigidBodyData> _GsplatForceOutputBuffer;
 
-groupshared int rigidBodyNormX;
-groupshared int rigidBodyNormY;
-groupshared int rigidBodyNormZ;
-groupshared int rigidBodyPosX;
-groupshared int rigidBodyPosY;
-groupshared int rigidBodyPosZ;
-groupshared int rigidBodyWeightSum;
-groupshared int rigidBodyPenetrationSum;
+groupshared float densityContributions[32];
+groupshared float3 gradientContributions[32];
 
 [numthreads(32, 1, 1)]
 void NarrowPhaseForRigidBodyData(uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
 {
-    // 1. 스레드 그룹이 공유하는 누적값을 명시적으로 초기화
-    if (groupThreadID.x == 0)
-    {
-        rigidBodyNormX = 0; // 법선 누적들 
-        rigidBodyNormY = 0;
-        rigidBodyNormZ = 0;
+    uint threadIndex = groupThreadID.x;
+    densityContributions[threadIndex] = 0.0f;
+    gradientContributions[threadIndex] = float3(0.0f, 0.0f, 0.0f);
 
-        rigidBodyPosX = 0;  // 접촉 위치 누적들
-        rigidBodyPosY = 0;
-        rigidBodyPosZ = 0;
-
-        rigidBodyWeightSum = 0;      // bounded 가중치 합
-        rigidBodyPenetrationSum = 0; // 같은 가중치를 적용한 Sigma 공간 접촉 여유 합
-    }
-
-    GroupMemoryBarrierWithGroupSync();  // 각 스레드 그룹에서 0번 스레드만 초기화를 진행하고, 나머지 스레드는 초기화를 대기 함
-
-    // 2. 스레드가 처리할 데이터를 각 스레드마다 할당
-    uint3 pair = _BVHTraversalResultReadBuffer[groupID.x]; // 스레드 별 데이터 분리
-    uint rbIndex = pair.x;  // 외부 Rigid Body 정보를 얻기 위한 인덱스
-    uint gsIndex = pair.y;  // Gsplat 오브젝트 정보를 얻기 위한 인덱스
-    uint globalNodeIdx = pair.z;    // BVH 리프 노드 정보를 얻기 위한 인덱스
+    // Dispatch 2가 반환한 (외부 Rigidbody, Gsplat, leaf) 하나를 스레드 그룹 하나가 처리한다.
+    uint3 pair = _BVHTraversalResultReadBuffer[groupID.x];
+    uint rbIndex = pair.x;
+    uint gsIndex = pair.y;
+    uint globalNodeIdx = pair.z;
     BVHNode1D node = _BVHBuffer[globalNodeIdx];
+    GsplatMetaData meta = _MetaDataBuffer[gsIndex];
 
-    // 리프 노드의 정보이면 node의 data2 값이 0 이하임
+    // 외부 OBB를 Gsplat local로 옮긴 뒤, 모든 leaf가 동일하게 사용할 밀도 평가점을 정한다.
+    // 현재 Gsplat 원점이 물체 중앙이라는 계약에 따라 OBB에서 local 원점에 가장 가까운 점을 사용한다.
+    RigidbodyOBB rbOBB = _RBOBBBuffer[rbIndex];
+    float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
+    float3 localAxisX = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);
+    float3 localAxisY = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
+    float3 localAxisZ = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
+    float3 scaleVector = float3(
+        length(mul(meta.worldToLocal, float4(1, 0, 0, 0))),
+        length(mul(meta.worldToLocal, float4(0, 1, 0, 0))),
+        length(mul(meta.worldToLocal, float4(0, 0, 1, 0)))
+    );
+    float3 localExtents = rbOBB.extents * scaleVector;
+    float3 originFromObbCenter = -localCenter;
+    float distX = clamp(dot(originFromObbCenter, localAxisX), -localExtents.x, localExtents.x);
+    float distY = clamp(dot(originFromObbCenter, localAxisY), -localExtents.y, localExtents.y);
+    float distZ = clamp(dot(originFromObbCenter, localAxisZ), -localExtents.z, localExtents.z);
+    float3 samplePositionLocal =
+        localCenter + distX * localAxisX + distY * localAxisY + distZ * localAxisZ;
+
     if (node.data2 <= 0)
     {
-        uint gaussianStartIdx = node.data1; // 가우시안 인덱스 정보
-        uint gaussianCount = (uint)(-node.data2); // 각 스레드에게 맡길 가우시안의 총 수
+        uint gaussianStartIdx = node.data1;
+        uint gaussianCount = (uint)(-node.data2);
 
-        if (groupThreadID.x < gaussianCount)
+        if (threadIndex < gaussianCount)
         {
-            GsplatMetaData meta = _MetaDataBuffer[gsIndex];
-            // 3. 각 스레드는 myGaussianIndex 정보를 하나씩 맡음
-            uint myGaussianIndex = meta.gaussianStartIndex + gaussianStartIdx + groupThreadID.x;
-
-            // 4. 외부 RigidBody OBB를 Gsplat의 로컬 좌표로 변환 (BVH는 Gsplat의 로컬 공간에 잇으나, 외부 Rigid Body는 월드 공간에 존재함)
-            // mul 순서는 W2L 변환 좌표가 앞에, 그 뒤에 Transform 정보가 와야 함
-            RigidbodyOBB rbOBB = _RBOBBBuffer[rbIndex];
-            float3 localCenter = mul(meta.worldToLocal, float4(rbOBB.center, 1.0f)).xyz;
-            float3 localAxisX = normalize(mul(meta.worldToLocal, float4(rbOBB.axisX, 0.0f)).xyz);  
-            float3 localAxisY = normalize(mul(meta.worldToLocal, float4(rbOBB.axisY, 0.0f)).xyz);
-            float3 localAxisZ = normalize(mul(meta.worldToLocal, float4(rbOBB.axisZ, 0.0f)).xyz);
-            // 크기는 Scale에 의해 왜곡될 수 있으므로 별도 계산 
-            float3 scaleVector = float3(
-                length(mul(meta.worldToLocal, float4(1, 0, 0, 0))),
-                length(mul(meta.worldToLocal, float4(0, 1, 0, 0))),
-                length(mul(meta.worldToLocal, float4(0, 0, 1, 0)))
-            );
-            float3 localExtents = rbOBB.extents * scaleVector;
-
-            // 5. Gaussian 중심에서 OBB까지 가장 가까운 점까지의 거리를 계산을 위한 과정
-            // 가우시안 데이터 추출
+            uint myGaussianIndex =
+                meta.gaussianStartIndex + gaussianStartIdx + threadIndex;
             float3 gPos = _PhysPositionBuffer[myGaussianIndex];
             float4 gRot = _PhysRotationBuffer[myGaussianIndex];
             float3 gScale = _PhysScaleBuffer[myGaussianIndex];
-            
-            // 6. 가우시안 중심점에서 OBB 중심점으로 향하는 벡터 계산
-            float3 d = gPos - localCenter;
-            
-            // 7. 위에서 구한 벡터(d)를 OBB의 3개 축에 각각 투영하여 거리를 측정, 이때 OBB의 상자 크기(Extents) 안으로 강제 절삭(Clamp)하여 수선의 발을 구함
-            float distX = clamp(dot(d, localAxisX), -localExtents.x, localExtents.x);
-            float distY = clamp(dot(d, localAxisY), -localExtents.y, localExtents.y);
-            float distZ = clamp(dot(d, localAxisZ), -localExtents.z, localExtents.z);
-            // 8. Closest Point (OBB 표면에서 가우시안과 가장 가까운 점) 획득
-            float3 closestPointLocal = localCenter + distX * localAxisX + distY * localAxisY + distZ * localAxisZ;
-            
-            // 9. 가우시안 중심(gPos)에서 OBB 최근접 점(closestPointLocal)으로 향하는 벡터를 구함
-            float3 deltaPos = closestPointLocal - gPos;
-            
-            // 10. 회전 취소 (Un-rotate) : 위에서 구한 벡터에 쿼터니언의 켤레(Conjugate)를 이용해 역회전을 적용해서 Gaussian의 주축 공간으로 옮김
+            float gOpacity = _PhysOpacityBuffer[myGaussianIndex];
+
+            float3 deltaPos = samplePositionLocal - gPos;
             float4 qInv = float4(-gRot.x, -gRot.y, -gRot.z, gRot.w);
             float3 localDelta = RotateVectorByQuaternion(deltaPos, qInv);
+            float3 sigmaSquared = max(gScale * gScale, 0.0000000001f);
+            float3 inverseCovarianceDeltaLocal = localDelta / sigmaSquared;
+            float mahalanobisSquared = dot(localDelta, inverseCovarianceDeltaLocal);
 
-            // 11. 스케일 취소 (Un-scale) : 축별로 찌그러진 타원체를 구(Sphere)로 폄
-            float3 scaledDelta = localDelta / max(gScale, 0.00001f);
-
-            // 12. 최종 마할라노비스 거리 : 위의 정규화 과정을 거친 정규화된 공간에서 거리를 측정. 타원 공간을 구형 공간으로 폈으므로, 이 벡터의 길이가 곧 마할라노비스 거리(Sigma)가 됨
-            // 또한 myDistance는 미터 단위 거리가 아닌 Sigma 단위이므로 임계값과 비교 가능
-            float myDistance = length(scaledDelta);
-            
-            // ===================Normal Vector 연산====================
-            // Sigma 단위 임계값보다 가까우면 충돌로 간주
-            if (myDistance <= _DistanceThreshold)
+            // BVH가 3σ AABB로 구성되므로 밀도장도 같은 3σ 범위에서 절단한다.
+            if (mahalanobisSquared <= 9.0f)
             {
-                // 13. 가우시안의 Scale 값 중 가장 작은 값을 가지는 로컬 축(X, Y, Z)을 찾아서 표면 법선 후보로 선택
-                float3 localAxis;
-                if (gScale.x <= gScale.y && gScale.x <= gScale.z)
-                    localAxis = float3(1, 0, 0);
-                else if (gScale.y <= gScale.x && gScale.y <= gScale.z)
-                    localAxis = float3(0, 1, 0);
-                else
-                    localAxis = float3(0, 0, 1);
+                float density =
+                    gOpacity * exp(-0.5f * mahalanobisSquared);
 
-                // 14. 찾아낸 로컬 축을 가우시안의 회전값(gRot)으로 회전시켜 Gsplat Local 공간의 Normal로 변환
-                float3 myLocalNormal = RotateVectorByQuaternion(localAxis, gRot);
+                // ∇ρ_i(x) = -ρ_i(x) Σ_i^-1 (x - μ_i)
+                float3 gaussianLocalGradient =
+                    -density * inverseCovarianceDeltaLocal;
+                float3 gsplatLocalGradient =
+                    RotateVectorByQuaternion(gaussianLocalGradient, gRot);
 
-                // 15. 최소축은 앞/뒤 구분이 없으므로 OBB 중심을 향하는 쪽으로 부호만 결정합니다.
-                // 최근접점과 Gaussian 중심이 일치해도 OBB 중심 방향은 유지됩니다.
-                float3 dirToCollider = localCenter - gPos;
-                if (dot(myLocalNormal, dirToCollider) < 0)
-                    myLocalNormal = -myLocalNormal;
-                
-                // 16. Local의 법선을, World 공간의 Normal로 변환하여 최종 정규화
-                // world 좌표계의 Normal을 구하기 위해서는 "'Local 좌표계를 World 좌표계로 변환하는 변환 행렬(L2W)'의 역행렬(^-1)의 전치 행렬(^T)"를 곱해야 한다. = (L2W^-1)^T
-                // 역행렬 전치를 곱해야 하는 이유는, "비균등 스케일"때문이다. 여기서 "역행렬"은 L2W대신 W2L을 곱하는 것으로, 전치는 순서를 뒤집는 것으로 적용하여, 결과적으로는 mul(v,M)으로 한다.
-                float3 worldNormal = normalize(mul(myLocalNormal, (float3x3)meta.worldToLocal));
-                
-                // 17. 가중합 누적
-                // 역거리 특이점을 사용하지 않고 접촉 경계에서 0, 중심에서 1이 되는 bounded 가중치를 사용합니다.
-                float myPenetration = _DistanceThreshold - myDistance;
-                float myWeight = myPenetration / max(_DistanceThreshold, 0.00001f);
+                // gradient는 법선과 달리 크기도 침투 깊이에 사용하므로 정규화하지 않는다.
+                float3 worldGradient =
+                    mul(gsplatLocalGradient, (float3x3)meta.worldToLocal);
 
-                // 18. Rigidbody 힘 적용 위치로 OBB 최근접점을 사용합니다.
-                float3 outputPositionLocal = closestPointLocal;
-
-                // 19. 법선, 위치, penetration 모두 동일한 고정소수점 가중치를 사용합니다.
-                const int fixedPointScale = 10000;
-                int fixedWeight = (int)(myWeight * fixedPointScale + 0.5f);
-                if (fixedWeight > 0)
-                {
-                    InterlockedAdd(rigidBodyNormX, (int)(worldNormal.x * fixedWeight));
-                    InterlockedAdd(rigidBodyNormY, (int)(worldNormal.y * fixedWeight));
-                    InterlockedAdd(rigidBodyNormZ, (int)(worldNormal.z * fixedWeight));
-                    InterlockedAdd(rigidBodyPosX, (int)(outputPositionLocal.x * fixedWeight));
-                    InterlockedAdd(rigidBodyPosY, (int)(outputPositionLocal.y * fixedWeight));
-                    InterlockedAdd(rigidBodyPosZ, (int)(outputPositionLocal.z * fixedWeight));
-                    InterlockedAdd(rigidBodyPenetrationSum, (int)(myPenetration * fixedWeight));
-                    InterlockedAdd(rigidBodyWeightSum, fixedWeight);
-                }
+                densityContributions[threadIndex] = density;
+                gradientContributions[threadIndex] = worldGradient;
             }
         }
     }
 
-    GroupMemoryBarrierWithGroupSync();  // 모든 스레드가 준비될 때까지 대기
+    GroupMemoryBarrierWithGroupSync();
 
-    // 0번 스레드만 최종 결과를 만들어 냄
-    if (groupThreadID.x == 0 && rigidBodyWeightSum > 0)
+    // leaf의 최대 32개 Gaussian 기여도를 float 정밀도로 병렬 reduction한다.
+    for (uint stride = 16; stride > 0; stride >>= 1)
     {
-        // 20. 대표 법선을 구하기 위해 총 가중치를 복원
-        float totalWeight = (float)rigidBodyWeightSum;
-
-        // 21. 법선 복구 한 뒤 정규화 하여, 가중치가 적용된 대표 법선의 길이 구함
-        float3 weightedNormalSum = float3(rigidBodyNormX, rigidBodyNormY, rigidBodyNormZ);
-        float normalLength = length(weightedNormalSum);
-
-        // 0 벡터 정규화만 방지합니다.
-        if (normalLength > 0.0001f)
+        if (threadIndex < stride)
         {
-            // 22. 가중치가 적용된 대표 위치를 계산
-            float3 finalLocalPosition = float3(rigidBodyPosX, rigidBodyPosY, rigidBodyPosZ) / totalWeight;
-
-            GsplatMetaData meta = _MetaDataBuffer[gsIndex];
-
-            rigidBodyData resultData;
-            resultData.rbIndex = rbIndex;
-            resultData.gsIndex = gsIndex;
-            resultData.position = mul(meta.localToWorld, float4(finalLocalPosition, 1.0f)).xyz;
-            resultData.normal = weightedNormalSum / normalLength;
-            resultData.penetration = (float)rigidBodyPenetrationSum / totalWeight;
-
-            _GsplatForceOutputBuffer.Append(resultData);
+            densityContributions[threadIndex] +=
+                densityContributions[threadIndex + stride];
+            gradientContributions[threadIndex] +=
+                gradientContributions[threadIndex + stride];
         }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // 전체 field 판정은 CPU가 같은 (rbIndex, gsIndex)의 모든 leaf 부분합을 더한 뒤 수행한다.
+    if (threadIndex == 0 && densityContributions[0] > 0.0f)
+    {
+        rigidBodyData resultData;
+        resultData.rbIndex = rbIndex;
+        resultData.gsIndex = gsIndex;
+        resultData.position =
+            mul(meta.localToWorld, float4(samplePositionLocal, 1.0f)).xyz;
+        resultData.gradient = gradientContributions[0];
+        resultData.density = densityContributions[0];
+
+        _GsplatForceOutputBuffer.Append(resultData);
     }
 }
